@@ -90,7 +90,9 @@ This document is research only. **No firmware binary or camera-ready patch has b
 
 | Register / range | Evidence and meaning | Confidence |
 |---|---|---|
-| `0xC0E20000 ... 0xC0E2FFFF` | `src/io_trace.c` comments identify **JPCORE (JP57, lossless)**; register-by-register model unknown. **Do not write blindly.** | Source-identified block, no verified field map |
+| `0xC0E00000 ... 0xC0E0FFFF` | QEMU-EOS identifies **JP51** as JPEG / old lossless encoder; physical register behavior is not fully modeled | Block identified in emulator (needs hardware verification) |
+| `0xC0E10000 ... 0xC0E1FFFF` | QEMU-EOS identifies **JP62** as H.264; *this* is the relevant block for higher-resolution H.264 investigation | Block identified in emulator (needs hardware verification) |
+| `0xC0E20000 ... 0xC0E2FFFF` | `src/io_trace.c` and QEMU-EOS identify **JP57** as the newer lossless JPEG codec, not the H.264 codec | Source-identified block, no complete field map |
 | `0xC0F04A08` | `platform/5D3.113/consts.h` and `platform/5D3.123/consts.h`: HD YUV write EDMAC destination pointer | High (specific to both supported 5D3 firmwares) |
 | `0xC0F04508` | Same files: LiveView YUV write EDMAC destination pointer | High |
 | `0xC0F04000 + n*0x100` | `src/edmac.c`: first EDMAC channel bank register bases, `+0x08` address, `+0x10` length | High for source mapping; dynamic allocation must be measured |
