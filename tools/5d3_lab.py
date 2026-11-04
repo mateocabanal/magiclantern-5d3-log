@@ -8,8 +8,8 @@ an authorized local ROM0/ROM1 dump of the matching camera firmware.
 Example:
     python3 tools/5d3_lab.py doctor
     python3 tools/5d3_lab.py unit
-    python3 tools/5d3_lab.py build --firmware 113
-    python3 tools/5d3_lab.py emulate --firmware 113 --gdb
+    python3 tools/5d3_lab.py --firmware 113 build
+    python3 tools/5d3_lab.py --firmware 113 emulate --gdb
 
 For real hardware performance, an actual camera test is still required.
 """
@@ -18,7 +18,8 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import shutil
+import tempfile
+import zipfile
 import subprocess
 import sys
 
@@ -43,16 +44,14 @@ def print_check(label: str, condition: bool, location: Path | str) -> None:
 
 
 def check_roms(rom_root: Path, firmware: str) -> tuple[bool, list[Path]]:
-    # QEMU-EOS reads QEMU_EOS_WORKDIR/5D3/ or /5D3/<firmware>/.
-    # Firmware-version directory naming depends on QEMU-EOS model settings.
-    dirs = [rom_root / "5D3" / ("1.1.3" if firmware == "113" else "1.2.3"),
-            rom_root / "5D3",
-            rom_root]
-    for directory in dirs:
-        files = [directory / "ROM0.BIN", directory / "ROM1.BIN"]
-        if all(f.is_file() and f.stat().st_size > 0 for f in files):
-            return True, files
-    return False, [rom_root / "5D3" / "ROM0.BIN", rom_root / "5D3" / "ROM1.BIN"]
+    # qemu-eos model_list.c: 5D3 ROM0=8 MiB, ROM1=16 MiB from DIGIC 5 defaults.
+    # QEMU_EOS_WORKDIR/5D3 is the model directory; the first run must use
+    # matching authentic ROMs, not the Magic Lantern installer/autoexec.
+    _ = firmware
+    roms = [(rom_root / "5D3" / "ROM0.BIN", 8 * 1024 * 1024),
+            (rom_root / "5D3" / "ROM1.BIN", 16 * 1024 * 1024)]
+    return (all(path.is_file() and path.stat().st_size == length
+                for path, length in roms), [path for path, _ in roms])
 
 
 def doctor(args: argparse.Namespace) -> int:
@@ -68,12 +67,13 @@ def doctor(args: argparse.Namespace) -> int:
     print_check("Patched EOS emulator", qemu_bin.is_file(), qemu_bin)
     present, files = check_roms(rom_dir, args.firmware)
     print_check("Actual Canon ROM0/ROM1", present, ", ".join(map(str, files)))
-    image = ROOT / "platform" / f"5D3.{args.firmware}" / "build" / "sd.qcow2"
-    print_check("QEMU SD image", image.is_file(), image)
+    image = ROOT / "platform" / f"5D3.{args.firmware}" / "build" / "magiclantern.zip"
+    print_check("QEMU firmware ZIP for virtual FAT card", image.is_file(), image)
     ptp_src = ROOT / "src" / "ptp-chdk.c"
     print_check("Optional USB PTP implementation", ptp_src.is_file(), ptp_src)
     print("\nNOTE: system/Homebrew qemu-system-arm is not a substitute for qemu-eos.")
     print("NOTE: no ROM dump was bundled with this repository.")
+    print("NOTE: --boot uses isolated virtual FAT cards; no guestmount required.")
     if not present:
         print("To boot real Canon firmware, obtain authorized matching ROM0/ROM1 dumps; a ML installer FIR or autoexec.bin is not a full ROM dump.")
     if not runner.is_file() or not qemu_bin.is_file():
@@ -98,55 +98,83 @@ def build(args: argparse.Namespace) -> int:
             f"ARM_BINPATH={arm_bin}",
             "CONFIG_QEMU=y" if args.qemu else "CONFIG_QEMU=n",
             f"-j{args.jobs}"]
+    if sys.platform == 'darwin':
+        # The inherited build uses GNU stat syntax, incompatible with macOS.
+        argv.append("STAT_CMD=stat -f '%N: %z bytes'")
     print("+", " ".join(argv), flush=True)
     if args.dry_run:
         return 0
-    return subprocess.call(argv, cwd=ROOT)
+    env = os.environ.copy()
+    # Keep tools local to the repository and ARM SDK; avoid changing global PATH.
+    local_tools = [ROOT / '.venv' / 'bin', arm_bin]
+    env['PATH'] = os.pathsep.join([str(p) for p in local_tools if p.is_dir()] + [env.get('PATH', '')])
+    return subprocess.call(argv, cwd=ROOT, env=env)
 
 
 def emulate(args: argparse.Namespace) -> int:
-    qemu_src, qemu_build, rom_dir, _ = config(args)
-    runner = qemu_src / "magiclantern" / "run_qemu.py"
+    """Boot an isolated virtual FAT card without guestmount or a physical SD."""
+    _, qemu_build, rom_dir, _ = config(args)
     qemu_bin = qemu_build / "arm-softmmu" / "qemu-system-arm"
-    image = ROOT / "platform" / f"5D3.{args.firmware}" / "build" / "sd.qcow2"
-    rom_ok, paths = check_roms(rom_dir, args.firmware)
+    build_zip = ROOT / "platform" / f"5D3.{args.firmware}" / "build" / "magiclantern.zip"
+    rom_ok, _ = check_roms(rom_dir, args.firmware)
 
     missing = []
     for name, exists in [
-        ("QEMU-EOS runner", runner.is_file()),
         ("Patched QEMU-EOS executable", qemu_bin.is_file()),
-        ("5D3 ROM0.BIN and ROM1.BIN", rom_ok),
-        ("ML build SD image (make disk_image)", image.is_file()),
+        ("5D3 8MiB ROM0.BIN and 16MiB ROM1.BIN", rom_ok),
+        ("5D3 QEMU build magiclantern.zip", build_zip.is_file()),
     ]:
         if not exists:
             missing.append(name)
-    if missing:
+    if missing and not args.dry_run:
         print("Emulation not started; prerequisites missing:", file=sys.stderr)
-        for x in missing:
-            print("  -", x, file=sys.stderr)
+        for name in missing:
+            print("  -", name, file=sys.stderr)
         print("Run: python3 tools/5d3_lab.py doctor", file=sys.stderr)
         return 2
 
-    # run_qemu.py chooses the FIRST matching platform dir for '5D3' and
-    # may choose the other firmware; refuse to allow an unsafe ambiguity.
-    path113 = ROOT / "platform" / "5D3.113"
-    path123 = ROOT / "platform" / "5D3.123"
-    if path113.is_dir() and path123.is_dir():
-        print("WARNING: upstream run_qemu.py searches by model prefix '5D3',", file=sys.stderr)
-        print("so the firmware-version folder selected is not guaranteed.", file=sys.stderr)
-        print("Use an explicit model-specific checkout or fix the upstream runner", file=sys.stderr)
-        print("to select the correct 5D3.<firmware> platform before first boot.", file=sys.stderr)
-        return 2
-
-    command = [sys.executable, str(runner), "5D3",
-               "-q", str(qemu_build), "-r", str(rom_dir),
-               "-s", str(ROOT), "--boot"]
-    if args.gdb:
-        command.append("--gdb")
-    print("+", " ".join(command), flush=True)
-    if args.dry_run:
-        return 0
-    return subprocess.call(command, cwd=runner.parent)
+    # QEMU's vvfat device presents a regular host directory as a virtual FAT
+    # card, removing the Linux guestmount dependency on Apple Silicon.
+    # Any writes go only into these temporary directories.
+    with tempfile.TemporaryDirectory(prefix="ml-5d3-virtual-cards-") as temp:
+        base = Path(temp)
+        sd = base / "sd"
+        cf = base / "cf"
+        sd.mkdir()
+        cf.mkdir()
+        if build_zip.is_file():
+            with zipfile.ZipFile(build_zip) as archive:
+                for member in archive.infolist():
+                    dest = (sd / member.filename).resolve()
+                    if not dest.is_relative_to(sd.resolve()):
+                        raise ValueError("Unsafe path inside build ZIP")
+                    if member.is_dir():
+                        dest.mkdir(parents=True, exist_ok=True)
+                    else:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.open(member) as src, dest.open("wb") as dst:
+                            from shutil import copyfileobj
+                            copyfileobj(src, dst)
+        argv = [
+            str(qemu_bin),
+            "-M", "5D3,firmware=boot=1",
+            "-drive", f"if=sd,format=raw,file=fat:rw:{sd}",
+            "-drive", f"if=ide,format=raw,file=fat:rw:{cf}",
+            "-display", "none",
+            "-serial", "stdio",
+            "-monitor", "none",
+            "-no-reboot",
+        ]
+        if args.gdb:
+            argv += ["-S", "-gdb", "tcp::1234"]
+        env = os.environ.copy()
+        env["QEMU_EOS_WORKDIR"] = str(rom_dir)
+        print("+", " ".join(argv), flush=True)
+        if args.dry_run:
+            if missing:
+                print("Dry-run only: " + "; ".join(missing) + " missing.")
+            return 0
+        return subprocess.call(argv, cwd=base, env=env)
 
 
 def main() -> int:
