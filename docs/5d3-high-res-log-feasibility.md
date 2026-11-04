@@ -77,3 +77,73 @@ Success requires **real camera output demonstrating actual higher-resolution det
 ## Deployment safety
 
 This document is research only. **No firmware binary or camera-ready patch has been validated.** Do not flash an experimental .FIR, adjust undocumented clocks or write undocumented H.264 registers on a valuable camera without reproducing the existing ROM state, recovery path and QEMU tests.
+
+## 2026-11-03 follow-up: GPU identification and direct-register research
+
+### Identified silicon vs. unidentified GPU
+
+- **Verified SoC identification**: DIGIC 5+ **CH4-6501**; TechInsights product `CAN-CH4-6501`, report `FAR-1206-803` (2012); camera parts catalog names 5D Mark III as a host of this part. The *full die-level report* is not available publicly in the sources examined. No per-block hardware video throughput table or H.264 maximum image size can be extracted from its public page.
+- **No confirmed 5D3 programmable GPU model**. The **Takumi GV550** graphics accelerator **is real**, but reverse-engineered Canon DIGIC 6 firmware identifies it alongside a Zico/Xtensa graphics subsystem. **Do not attribute this model to the DIGIC 5+ / 5D3.** The Magic Lantern source explicitly says its dedicated compositor applies to DIGIC 6+ (`src/compositor.c`); a CHDK firmware investigation separately discovered GV550 strings in DIGIC 6 PowerShot models.
+- In **Magic Lantern 30C3 2013 hardware presentation section 7.1**, a developer identified **JPCORE as hardware JPEG *and H.264* encode/decode** for the DIGIC 4/5 family. This identifies the correct **class of hardware** to inspect, but does not prove that a DIGIC 5+ on a 5D3 can handle 4K H.264.
+
+### Lower-level interfaces already identified in source
+
+| Register / range | Evidence and meaning | Confidence |
+|---|---|---|
+| `0xC0E20000 ... 0xC0E2FFFF` | `src/io_trace.c` comments identify **JPCORE (JP57, lossless)**; register-by-register model unknown. **Do not write blindly.** | Source-identified block, no verified field map |
+| `0xC0F04A08` | `platform/5D3.113/consts.h` and `platform/5D3.123/consts.h`: HD YUV write EDMAC destination pointer | High (specific to both supported 5D3 firmwares) |
+| `0xC0F04508` | Same files: LiveView YUV write EDMAC destination pointer | High |
+| `0xC0F04000 + n*0x100` | `src/edmac.c`: first EDMAC channel bank register bases, `+0x08` address, `+0x10` length | High for source mapping; dynamic allocation must be measured |
+| `0xC0F05020 + 4*conn` | `src/edmac.c`: EDMAC connection routing table | Source mapping, semantics partially uncertain |
+| `0xC0F26000`, `0xC0F30000` | `src/edmac.c`: other EDMAC channel banks | Source mapping |
+| JPCORE encoded stream output | Magic Lantern register-map descriptions suggest JPEG encoded data on EDMAC connection 0x05, but the exact 5D3 JPCORE-to-H.264 routing remains unverified | Hypothesis |
+
+`modules/silent/lossless.c` contains known ROM calls for 5D3 v1.1.3 and 1.2.3, proving practical invocation of lossless RAW compression via Canon's setup sequence. **Our target is replacing those Canon setup calls by interpreting the ENGIO/JPCORE/EDMAC register transactions they perform.** The starting point must be *observational instrumentation*, not guesses about control bits.
+
+### Cross-camera experiment: why the EOS-1D C matters
+
+Canon's **EOS-1D C** (2012) has **dual DIGIC 5+ processors**, records 4096×2160/24p **8-bit 4:2:2 Motion JPEG**, and supports **Canon Log**. Canon documents 4K storage at **3.76 GB per minute**, i.e. about **62.7 MB/s / 501 Mb/s**. It uses **H.264 only at 1080p and below**. This shows **the DIGIC 5+ generation participates in a working 4K LOG pipeline with JPEG compression**; it does *not* show a single 5D3 DIGIC 5+ can do that pipeline or 4K H.264.
+
+A rough throughput comparison for engineering triage, not a speed guarantee:
+
+- 5D3 22.3 MP × 6 still photos/s ≈ **133.8 MP/s** full-resolution imaging; actual JPEG compression throughput may be higher and cannot be isolated from this spec.
+- 3072 × 1920 × 24 = **141.6 MP/s**, about **1.06×** the still-photo pixel rate.
+- 3840 × 1600 × 24 = **147.5 MP/s**, about **1.10×**.
+- 4096 × 2160 × 24 = **212.3 MP/s**, about **1.59×**.
+- EOS-1D C uses *two* DIGIC 5+ processors for 212.3 MP/s 4K MJPEG; the workload distribution between processors is unknown.
+
+By a **simple pixel-proportional bitrate extrapolation only**, 3072×1920/24 MJPEG at EOS-1D C 4K compression settings would average ~**41.8 MB/s** rather than ~62.7 MB/s. This *is not* a verified camera bitrate; content and firmware codec settings matter.
+
+### The definite answer that is and is not supported
+
+| Question | Finding |
+|---|---|
+| Is the 5D3 SoC identified? | **Yes: DIGIC 5+ / CH4-6501** |
+| Is a particular 5D3 programmable GPU identified? | **No.** Takumi GV550 belongs to DIGIC 6 evidence, not 5D3 evidence |
+| Is a register-mapped image-codec accelerator present? | **Yes: JPCORE**, with source-mapped register region and existing functional ML routines |
+| Does the camera's sensor support >1080p frame capture? | **Yes**, in experimental RAW readout modes |
+| Did a dual DIGIC 5+ camera ship 4K LOG recording? | **Yes: EOS-1D C, Motion JPEG, dual SoCs** |
+| Has **one 5D3 chip** been demonstrated doing 3K/4K video *via hardware JPEG* at 24 fps? | **Not established** |
+| Does **5D3 JPCORE H.264** accept 3K/4K geometry? | **Not established; stock Canon uses H.264 at <=1080p** |
+| Can a camera-less source review provide a definitive max encoder resolution/fps? | **No**; requires hardware documentation or tests |
+
+**Experimental pass criterion:** produce **actual decoded footage with spatial detail above 1080p** using a verified hardware compression path at target frame rate, with sustained frames and no corruption. Changing H.264 SPS/MOV dimensions alone is insufficient.
+
+### Safe investigation tooling
+
+`tools/compare_mmio_traces.py` compares existing **Magic Lantern textual MMIO logs** to identify *observed* register writes between modes. It is an offline parser and has no camera access. Test with `python3 -m unittest discover -s tests -p 'test_compare_mmio_traces.py'`.
+
+Recommended trace modes from **the same camera and firmware version**: 1080p24 H.264 recording start; 720p50/60 H.264 recording start; still full-resolution JPEG capture; high-resolution RAW crop mode. Trace only bounded regions if the on-camera tracing setup is proven safe. Current `src/io_trace.c` has incomplete model-specific dump buffers for 5D3; **do not deploy a generic build** without implementing and testing the logger's memory allocation and crash-recovery logic.
+
+**Availability / verification:** Local workstation has Magic Lantern packages for 5D3.113 but I have not found a full 5D3 Canon ROM image or a physical camera connection. Neither the Python tool nor firmware-source inspection can substitute for a real encoder benchmark.
+
+### Further references
+
+- TechInsights: https://www.techinsights.com/ja/node/18511
+- Model listing: https://photo-parts.com.ua/parts/part_profile.php?part=5481
+- Magic Lantern 30C3 developer slides, section 7.1: https://fahrplan.events.ccc.de/congress/2013/Fahrplan/system/attachments/2246/original/Magic_Lantern_30C3.pdf
+- Canon EOS-1D C official specs: https://www.usa.canon.com/support/p/eos-1d-c
+- Canon EOS-1D C museum, video modes and bitrate: https://global.canon/en/c-museum/product/cesc824.html
+- Canon EOS 5D Mark III official specs: https://www.usa.canon.com/support/p/eos-5d-mark-iii
+- CHDK analysis of GV550 on DIGIC 6: https://chdk.setepontos.com/d/12788-display-bitmap-overlay
+- Takumi GV550 manufacturer: https://www.takumi-corp.com/%E3%82%B0%E3%83%A9%E3%83%95%E3%82%A3%E3%83%83%E3%82%AF%E3%82%B9%E6%8F%8F%E7%94%BB%E6%80%A7%E8%83%BD%E3%82%92%E5%A4%A7%E5%B9%85%E5%90%91%E4%B8%8A%E3%81%95%E3%81%9B%E3%81%9F%E3%83%8F%E3%82%A4/
